@@ -2,8 +2,14 @@
 This is a project experimenting with language-vision models (LVM) on a challenging visual question answering (VQA) task.
 The dataset and baselines can be found at https://huggingface.co/datasets/visual-riddles/visual_riddles
 It consists of images and a question with a non-trivial catch. For example:
-![image](https://github.com/user-attachments/assets/e78c36dd-07ed-411f-ad2e-f5562a9061aa)
+
+
 Which chair should you sit on?
+
+
+![image](https://github.com/user-attachments/assets/e78c36dd-07ed-411f-ad2e-f5562a9061aa)
+
+
 The answer requires noticing that a leg is missing from one chair, and real-world knowledge to infer that that would be uncomfortable.
 Even SoTA commercial LVMs like GPT4 and Gemini find this challenging.
 The experiments in this repository stick to the open-ended question answering task.
