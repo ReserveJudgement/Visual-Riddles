@@ -49,6 +49,9 @@ def solve_from_image(modelname, filename, safety_config, systemprompt, tag):
     df.to_csv(f"./gemini_openended_zeroshot_{tag}.csv", index=False)
     return
 
+############################
+# Functions for evaluation #
+############################
 
 # Automatic evaluation using Gemini
 def autojudge(modelname, answerfile, safety_config):
@@ -82,6 +85,58 @@ def autojudge(modelname, answerfile, safety_config):
     judgements.to_csv(f"./eval_{answerfile}", index=False)
     return
 
+
+def autojudge_explanations(modelname, dataset, cluesfile, answerfile, safety_config):
+    model = genai.GenerativeModel(modelname, safety_settings=safety_config)
+    riddles = pd.read_csv(answerfile)
+    riddles["judge"] = riddles["judge"].str.strip()
+    riddles = riddles[(riddles["judge"] == "No") | (riddles["judge"] == "No.") | (riddles["judge"] == "Answer:No.")]
+    print("Wrong answers: ", len(riddles.index))
+    judgements = []
+    tokencount = 0
+    request = 0
+    for i, riddle in tqdm(riddles.iterrows()):
+        sample = dataset.iloc[i, :]
+        question = riddle["question"]
+        assert question == sample["question"]
+        ground_truth = riddle["ground-truth"]
+        assert ground_truth == sample["ground_truth_answer"]
+        candidate_answer = riddle["candidate-answer"]
+        img = sample["image"]
+        # construct prompt
+        txt = f"Answer with only 1, 2, 3. Given the image, the question, the detected evidence and the ground-truth answer, why was the candidate answer incorrect?\nQuestion: {question}\nCandidate Answer: {candidate_answer}\nGround-Truth Answer:{ground_truth}\nThe ground-truth answer is the real and correct full-answer for the visual riddle containing the question and the image - USE it to decide why the candidate answer was incorrect.\nOptions:\n1. A necessary piece of evidence was not detected in the image.\n2. A required piece of external information was missed (for example cultural or scientific background knowledge).\n3. All necessary information was available but there was a failure in reasoning.\nDo not forget, answer with only 1, 2 or 3."
+        prompt = [img, txt]
+        tokencount += model.count_tokens(prompt).total_tokens
+        request += 1
+        if tokencount >= 1000000 or request >= 15:
+            time.sleep(60)
+            tokencount = 0
+            request = 0
+        # get response from model
+        response = model.generate_content(prompt)
+        result = response.text.split()[0]
+        if (result[0] == "1") or (result[0] == "2") or (result[0] == "3"):
+            answer = int(result[0])
+        else:
+            answer = "undetermined"
+        judgements.append({"idx": i, "question": question, "candidate_answer": candidate_answer, "ground-truth": ground_truth, "evaluation": response.text, "reason": answer})
+    judgements = pd.DataFrame(judgements)
+    judgements.to_csv(f"./matan/failure_analysis_flash_fewshotclues.csv", index=False)
+    total = len(judgements.index)
+    missed_evidence = len(judgements[judgements["reason"] == 1].index)
+    missed_knowledge = len(judgements[judgements["reason"] == 2].index)
+    bad_reasoning = len(judgements[judgements["reason"] == 3].index)
+    print("total: ", total)
+    print(f"missed evidence: {missed_evidence}, {missed_evidence/total}")
+    print(f"missed knowledge: {missed_knowledge}, {missed_knowledge / total}")
+    print(f"bad reasoning: {bad_reasoning}, {bad_reasoning / total}")
+    return
+
+
+
+###################################
+# Functions for chain of thoughts #
+###################################
 
 # Extract clues from image in json format as first step in chain-of-thought process
 def extract_clues(modelname, data, safety_config, systemprompt, tag, func=None, mode="from_image"):
@@ -267,6 +322,101 @@ def optimize_prompt(modelname, promptername, data, evalset, safety_config):
     outcome.to_csv("./prompt_trials2.csv", index=False)
     print(outcome)
     return
+
+##########################
+# functions for few-shot #
+##########################
+
+def compose_grid(images, separator_width=10):
+    """
+    Composes a 2x2 grid from a list of 4 images with a white separator between images,
+    ensuring all images are resized to the same dimensions.
+
+    Args:
+    images (list): List of 4 PIL Image objects.
+    separator_width (int): Width of the separator line between images.
+    size (tuple): The desired size (width, height) for each image.
+
+    Returns:
+    Image: A PIL Image object with the 2x2 grid.
+    """
+    if len(images) != 4:
+        raise ValueError("The list must contain exactly 4 images.")
+
+    size = images[-1].size
+    # Resize all images to the same size
+    resized_images = [img.resize(size) for img in images]
+
+    # Get the size of the resized images
+    width, height = size
+
+    # Calculate new size considering separators
+    total_width = width * 2 + separator_width
+    total_height = height * 2 + separator_width
+
+    # Create a blank image with size to fit 2x2 grid with separators
+    grid_image = Image.new('RGB', (total_width, total_height), 'white')
+
+    # Paste images into the grid with separators
+    grid_image.paste(resized_images[0], (0, 0))
+    grid_image.paste(resized_images[1], (width + separator_width, 0))
+    grid_image.paste(resized_images[2], (0, height + separator_width))
+    grid_image.paste(resized_images[3], (width + separator_width, height + separator_width))
+
+    return grid_image
+
+
+def get_shots_imgs(current_id, dataset, num_of_shots=3):
+    img_list = []
+    text = ""
+    rand_shots = [current_id]
+    while current_id in rand_shots:
+        rand_shots = np.random.permutation(len(dataset.index))[:num_of_shots]
+    for i, loc in zip(range(1, num_of_shots + 1), ['Top-Left', 'Top-Right', 'Bottom-Left']):
+        sample = dataset.iloc[int(rand_shots[i - 1]), :]
+        text += f"\n[{i}.{loc} image] \nQuestion: {sample['question']}"
+        text += f"\nAnswer: {sample['ground_truth_answer']}\n\n"
+        img_list.append(sample['image'])
+    return text, img_list
+
+
+def get_prompt_img_fs(current_id, sample, dataset, num_of_shots=3):
+    text = f"This is a visual riddle. Here are {num_of_shots} examples to give you an idea of what is required:\n"
+    shots, img_list = get_shots_imgs(current_id, dataset)
+    img_list.append(sample['image'])
+
+    fs_img = compose_grid(img_list)
+    text += shots
+    text += f"\nNow your turn! Take a deep breath, look for clues and think step by step. If you are not sure, give the most likely answer. \n[4.Bottom-Right image]\nQuestion: {sample['question']}\nAnswer:"
+    return text, fs_img
+
+
+def fewshot(modelname, dataset, safety):
+    model = genai.GenerativeModel(modelname, safety_settings=safety)
+    tokencount = 0
+    request = 0
+    results = []
+    dataset = dataset.iloc[50:100, :]
+    for i, sample in tqdm(dataset.iterrows()):
+        text, img = get_prompt_img_fs(i, sample, dataset)
+        prompt = [img, text]
+        tokencount += model.count_tokens(prompt).total_tokens
+        request += 1
+        if tokencount > 32000 or request > 2:
+            time.sleep(60)
+            tokencount = 0
+            request = 0
+        response = model.generate_content(prompt)
+
+        results.append({"idx": i,
+                        "prompt": text,
+                        "response": response.text,
+                        "ground-truth": sample['ground_truth_answer']})
+
+    results = pd.DataFrame(results)
+    results.to_csv("./gemini_solutions_fewshot2.csv", index=False)
+    return results
+
 
 
 if __name__ == '__main__':
